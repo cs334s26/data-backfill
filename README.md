@@ -149,22 +149,49 @@ Or if the script is in a git repo:
 git clone https://github.com/your-org/your-repo.git
 ```
 
-### Step 5 — Set environment variables
+### Step 5 — Set up the .env file
+
+Create a `.env` file in your home directory to store your credentials:
 
 ```bash
+nano ~/.env
+```
+
+Paste the following into the file, filling in your real values:
+
+```bash
+# Required
 export AWS_ACCESS_KEY_ID=your-access-key
 export AWS_SECRET_ACCESS_KEY=your-secret-key
 export AWS_REGION=us-east-1
 export OPENSEARCH_HOST=https://the-domain-endpoint
+
+# Optional — only needed if USE_S3=true
+# export USE_S3=true
+# export S3_BUCKET_NAME=my-regulations-bucket
 ```
 
-To make these permanent so they survive a logout, add them to `~/.bashrc`:
+Save and close the file (`Ctrl+O`, `Enter`, `Ctrl+X` in nano).
+
+Lock down the file so only you can read it:
 ```bash
-echo 'export AWS_ACCESS_KEY_ID=your-access-key' >> ~/.bashrc
-echo 'export AWS_SECRET_ACCESS_KEY=your-secret-key' >> ~/.bashrc
-echo 'export AWS_REGION=us-east-1' >> ~/.bashrc
-echo 'export OPENSEARCH_HOST=https://the-domain-endpoint' >> ~/.bashrc
-source ~/.bashrc
+chmod 600 ~/.env
+```
+
+Load the variables into your session:
+```bash
+source ~/.env
+```
+
+To make this automatic on every login so you never have to run `source` manually, add it to `~/.bashrc`:
+```bash
+echo 'source ~/.env' >> ~/.bashrc
+```
+
+Verify the variables loaded correctly:
+```bash
+echo $OPENSEARCH_HOST
+echo $AWS_ACCESS_KEY_ID
 ```
 
 ### Step 6 — Make the script executable and verify the connection
