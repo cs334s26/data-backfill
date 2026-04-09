@@ -338,49 +338,108 @@ def process_docket(docket_id: str, data: dict, session, os_client):
 # Main
 # ---------------------------------------------------------------------------
 
-def run(agency: str):
-    log.info("Starting ingestion for agency: %s", agency)
-    log.info("Bucket: s3://%s/%s/%s/", S3_BUCKET, S3_PREFIX, agency)
-
+def run(start: int, end: int):
     s3        = get_s3_client()
     os_client = get_opensearch_client()
     session   = get_http_session()
 
     ensure_index(os_client)
 
-    log.info("Listing dockets for agency '%s'...", agency)
-    dockets = list_dockets(s3, agency)
+    log.info("Listing all agencies in s3://%s/%s/...", S3_BUCKET, S3_PREFIX)
+    agencies = list_agencies(s3)
 
-    if not dockets:
-        log.warning("No dockets found for agency '%s' — check the agency name and bucket structure", agency)
+    if not agencies:
+        log.error("No agencies found in s3://%s/%s/ — check bucket and credentials", S3_BUCKET, S3_PREFIX)
         sys.exit(1)
 
-    total = len(dockets)
-    log.info("Found %d dockets", total)
+    total_agencies = len(agencies)
+    log.info("Found %d agencies total:", total_agencies)
+    for i, name in enumerate(agencies, start=1):
+        log.info("  [%d] %s", i, name)
 
-    for idx, docket_id in enumerate(dockets, start=1):
-        log.info("=== Docket %d / %d: %s ===", idx, total, docket_id)
+    # Validate range (1-based, inclusive on both ends)
+    if start < 1 or start > total_agencies:
+        log.error("start index %d is out of range (1-%d)", start, total_agencies)
+        sys.exit(1)
+    if end > total_agencies:
+        log.warning("end index %d exceeds total — clamping to %d", end, total_agencies)
+        end = total_agencies
 
-        data = read_docket_json(s3, agency, docket_id)
-        if data is None:
+    selected = agencies[start - 1:end]  # convert 1-based to 0-based slice
+    log.info("Processing agencies %d-%d: %s", start, end, ", ".join(selected))
+
+    for agency_idx, agency in enumerate(selected, start=start):
+        log.info("*** Agency %d / %d: %s ***", agency_idx, total_agencies, agency)
+
+        dockets = list_dockets(s3, agency)
+        if not dockets:
+            log.warning("No dockets found for agency '%s' — skipping", agency)
             continue
 
-        process_docket(docket_id, data, session, os_client)
+        log.info("Found %d dockets for %s", len(dockets), agency)
 
-    log.info("Done. Processed %d dockets for agency '%s'.", total, agency)
+        for d_idx, docket_id in enumerate(dockets, start=1):
+            log.info("=== Docket %d / %d: %s ===", d_idx, len(dockets), docket_id)
+
+            data = read_docket_json(s3, agency, docket_id)
+            if data is None:
+                continue
+
+            process_docket(docket_id, data, session, os_client)
+
+    log.info("Done. Processed agencies %d-%d.", start, end)
 
 # ---------------------------------------------------------------------------
-# Entry point  —  agency passed as $1 (bash convention)
+# Entry point  —  $1 = start index, $2 = end index (1-based, inclusive)
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: ./ingest_regulations.py <agency>")
-        print("  $1  agency code, e.g. CMS, EPA, FDA")
+        print("Usage: ./ingest_regulations.py <start> [end]")
         print()
-        print("  Processes all dockets under:")
-        print("  s3://mirrulations/raw-data/<agency>/")
+        print("  $1  start   Agency index to start from (1-based)")
+        print("  $2  end     Agency index to stop at, inclusive (default: same as start)")
+        print()
+        print("  Agencies are the folders found in s3://mirrulations/raw-data/")
+        print()
+        print("  Examples:")
+        print("    ./ingest_regulations.py 1        # process agency #1 only")
+        print("    ./ingest_regulations.py 1 15     # process agencies 1 through 15")
+        print("    ./ingest_regulations.py 16 30    # process agencies 16 through 30")
+        print()
+        print("  Tip: run with any number to see the full numbered agency list first.")
         sys.exit(1)
 
-    agency = sys.argv[1].strip()
-    run(agency)
+    try:
+        start = int(sys.argv[1])
+    except ValueError:
+        print(f"Error: start must be an integer, got '{sys.argv[1]}'")
+        sys.exit(1)
+
+    try:
+        end = int(sys.argv[2]) if len(sys.argv) > 2 else start
+    except ValueError:
+        print(f"Error: end must be an integer, got '{sys.argv[2]}'")
+        sys.exit(1)
+
+    run(start, end)
+
+# ---------------------------------------------------------------------------
+# List all agencies in the bucket
+# ---------------------------------------------------------------------------
+
+def list_agencies(s3) -> list:
+    """
+    List all agency folders under s3://mirrulations/raw-data/
+    Returns a sorted list of agency names e.g. ['CMS', 'EPA', 'FDA', ...]
+    """
+    prefix    = f"{S3_PREFIX}/"
+    paginator = s3.get_paginator("list_objects_v2")
+    agencies  = []
+
+    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix, Delimiter="/"):
+        for cp in page.get("CommonPrefixes", []):
+            agency = cp["Prefix"].rstrip("/").split("/")[-1]
+            agencies.append(agency)
+
+    return sorted(agencies)
