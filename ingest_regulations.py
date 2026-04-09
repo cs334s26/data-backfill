@@ -111,7 +111,7 @@ def get_opensearch_client():
     port    = parsed.port or 443
 
     # OpenSearch Serverless uses IAM SigV4 signing — no username/password
-    credentials = boto3.Session().get_credentials().resolve()
+    credentials = boto3.Session().get_credentials().get_frozen_credentials()
     auth        = AWSV4SignerAuth(credentials, CONFIG["aws_region"], "aoss")
 
     return OpenSearch(
