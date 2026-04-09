@@ -81,7 +81,7 @@ def extract_urls_from_json(s3, key: str) -> list:
         return [
             fmt.get("fileUrl", "")
             for fmt in formats
-            if is_html_url(fmt.get("fileUrl", ""))
+            if fmt and is_html_url(fmt.get("fileUrl", ""))
         ]
     except (ClientError, json.JSONDecodeError, KeyError):
         return []
