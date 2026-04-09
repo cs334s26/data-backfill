@@ -23,9 +23,9 @@ Required environment variables:
   AWS_ACCESS_KEY_ID
   AWS_SECRET_ACCESS_KEY
   AWS_REGION             (default: us-east-1)
-  OPENSEARCH_HOST        e.g. https://search-my-domain.us-east-1.es.amazonaws.com
-  OPENSEARCH_USER        basic auth username
-  OPENSEARCH_PASSWORD    basic auth password
+  OPENSEARCH_HOST        e.g. https://<collection-id>.us-east-1.aoss.amazonaws.com
+
+  Note: OpenSearch Serverless uses IAM auth (SigV4) — no username/password needed.
 """
 
 import datetime
@@ -40,7 +40,7 @@ import boto3
 import requests
 from botocore.exceptions import ClientError
 from bs4 import BeautifulSoup
-from opensearchpy import OpenSearch, RequestsHttpConnection, NotFoundError
+from opensearchpy import OpenSearch, RequestsHttpConnection, NotFoundError, AWSV4SignerAuth
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -61,11 +61,9 @@ S3_BUCKET = "mirrulations"
 S3_PREFIX = "raw-data"
 
 CONFIG = {
-    "opensearch_host":     os.getenv("OPENSEARCH_HOST", "https://localhost:9200"),
-    "opensearch_index":    "documents_text",   # hardcoded — do not change
-    "opensearch_user":     os.getenv("OPENSEARCH_USER", "admin"),
-    "opensearch_password": os.getenv("OPENSEARCH_PASSWORD", "admin"),
-    "aws_region":          os.getenv("AWS_REGION", "us-east-1"),
+    "opensearch_host":  os.getenv("OPENSEARCH_HOST", ""),
+    "opensearch_index": "documents_text",   # hardcoded — do not change
+    "aws_region":       os.getenv("AWS_REGION", "us-east-1"),
 }
 
 HEADERS = {
@@ -109,16 +107,20 @@ def get_s3_client():
 
 def get_opensearch_client():
     parsed  = urlparse(CONFIG["opensearch_host"])
-    use_ssl = parsed.scheme == "https"
     host    = parsed.hostname
-    port    = parsed.port or (443 if use_ssl else 9200)
+    port    = parsed.port or 443
+
+    # OpenSearch Serverless uses IAM SigV4 signing — no username/password
+    credentials = boto3.Session().get_credentials()
+    auth        = AWSV4SignerAuth(credentials, CONFIG["aws_region"], "aoss")
 
     return OpenSearch(
         hosts=[{"host": host, "port": port}],
-        http_auth=(CONFIG["opensearch_user"], CONFIG["opensearch_password"]),
-        use_ssl=use_ssl,
+        http_auth=auth,
+        use_ssl=True,
         verify_certs=True,
         connection_class=RequestsHttpConnection,
+        pool_maxsize=20,
     )
 
 # ---------------------------------------------------------------------------
@@ -164,7 +166,7 @@ def ingest_document(os_client, docket_id: str, document_id: str, text: str):
 # S3 helpers
 # ---------------------------------------------------------------------------
 
-def list_dockets(s3, agency: str) -> list[str]:
+def list_dockets(s3, agency: str):
     """
     List all docket IDs under s3://mirrulations/raw-data/<agency>/
     Returns a list of docket ID strings e.g. ['CMS-2026-1420', ...]
@@ -182,7 +184,7 @@ def list_dockets(s3, agency: str) -> list[str]:
     return dockets
 
 
-def read_docket_json(s3, agency: str, docket_id: str) -> dict | None:
+def read_docket_json(s3, agency: str, docket_id: str):
     """
     Read the docket JSON from:
       s3://mirrulations/raw-data/<agency>/<docket-id>/text-<docket-id>/docket/<docket-id>.json
@@ -428,7 +430,7 @@ if __name__ == "__main__":
 # List all agencies in the bucket
 # ---------------------------------------------------------------------------
 
-def list_agencies(s3) -> list:
+def list_agencies(s3):
     """
     List all agency folders under s3://mirrulations/raw-data/
     Returns a sorted list of agency names e.g. ['CMS', 'EPA', 'FDA', ...]
