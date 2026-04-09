@@ -328,6 +328,26 @@ def process_docket(docket_id: str, data: dict, session, os_client):
                 log.error("Unexpected error for document '%s': %s", doc_id_key, e)
 
 # ---------------------------------------------------------------------------
+# List all agencies in the bucket
+# ---------------------------------------------------------------------------
+
+def list_agencies(s3):
+    """
+    List all agency folders under s3://mirrulations/raw-data/
+    Returns a sorted list of agency names e.g. ['CMS', 'EPA', 'FDA', ...]
+    """
+    prefix    = f"{S3_PREFIX}/"
+    paginator = s3.get_paginator("list_objects_v2")
+    agencies  = []
+
+    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix, Delimiter="/"):
+        for cp in page.get("CommonPrefixes", []):
+            agency = cp["Prefix"].rstrip("/").split("/")[-1]
+            agencies.append(agency)
+
+    return sorted(agencies)
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -416,23 +436,3 @@ if __name__ == "__main__":
         sys.exit(1)
 
     run(start, end)
-
-# ---------------------------------------------------------------------------
-# List all agencies in the bucket
-# ---------------------------------------------------------------------------
-
-def list_agencies(s3):
-    """
-    List all agency folders under s3://mirrulations/raw-data/
-    Returns a sorted list of agency names e.g. ['CMS', 'EPA', 'FDA', ...]
-    """
-    prefix    = f"{S3_PREFIX}/"
-    paginator = s3.get_paginator("list_objects_v2")
-    agencies  = []
-
-    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix, Delimiter="/"):
-        for cp in page.get("CommonPrefixes", []):
-            agency = cp["Prefix"].rstrip("/").split("/")[-1]
-            agencies.append(agency)
-
-    return sorted(agencies)
