@@ -15,7 +15,7 @@ Each person runs the script with one or more **agency codes** (e.g. `CMS`,
 ## How it works
 
 ```
-S3: s3://mirrulations/raw-data/<agency>/<docket-id>/text-<docket-id>/docket/<docket-id>.json
+S3: s3://mirrulations/raw-data/<agency>/<docket-id>/text-<docket-id>/documents/<doc-id>.json
         ↓ read JSON
         ↓ find HTML URLs in fileFormats
         ↓ check OpenSearch — skip if already ingested
@@ -38,23 +38,30 @@ S3: s3://mirrulations/raw-data/<agency>/<docket-id>/text-<docket-id>/docket/<doc
 
 ## AWS Permissions Setup (do this once)
 
-All 20 users must have IAM accounts in the main AWS account. The steps below
-set up a shared IAM group so permissions are managed in one place.
+All users must have IAM accounts in the main AWS account. The steps below
+cover everything an account admin needs to set up, and what each user needs
+to do themselves.
 
-### 1. Create an IAM group
+---
+
+### Part A — For the account admin
+
+#### 1. Create an IAM group
 
 1. Go to **IAM** in the AWS console
 2. Click **User groups** → **Create group**
 3. Name it `regulations-ingesters`
 4. Click **Create group**
 
-### 2. Add all users to the group
+#### 2. Add all users to the group
 
 1. Click into the `regulations-ingesters` group
 2. Go to the **Users** tab → **Add users**
-3. Select all 20 users and click **Add users**
+3. Select all users and click **Add users**
 
-### 3. Attach permissions to the group
+#### 3. Attach an IAM policy to the group
+
+This gives the group permission to read from S3 and use OpenSearch Serverless.
 
 1. Click into the group → **Permissions** tab
 2. Click **Add permissions** → **Create inline policy**
@@ -66,8 +73,8 @@ set up a shared IAM group so permissions are managed in one place.
   "Statement": [
     {
       "Effect": "Allow",
-      "Action": "es:*",
-      "Resource": "arn:aws:es:us-east-1:MAIN_ACCOUNT_ID:domain/DOMAIN_NAME/*"
+      "Action": "aoss:*",
+      "Resource": "*"
     },
     {
       "Effect": "Allow",
@@ -84,51 +91,62 @@ set up a shared IAM group so permissions are managed in one place.
 }
 ```
 
-4. Replace `MAIN_ACCOUNT_ID` and `DOMAIN_NAME` with the real values
-5. Name the policy `regulations-ingester-access` → **Create policy**
+4. Name the policy `regulations-ingester-access` → **Create policy**
 
-### 4. Add the group to the OpenSearch access policy
+#### 4. Add each user to the OpenSearch Serverless data access policy
 
-The domain owner needs to do this:
+This is the critical step that allows users to actually read and write to the
+`documents_text` index. The OpenSearch collection being used is `mirrulations`.
 
-1. Go to **Amazon OpenSearch Service** → click the domain
-2. **Security configuration** tab → **Access policy** → **Edit**
-3. Add this statement:
+> **Important:** This is OpenSearch **Serverless** — it does NOT use
+> username/password or OpenSearch Dashboards for access control. It uses
+> AWS IAM identity-based access via data access policies only.
 
-```json
-{
-  "Effect": "Allow",
-  "Principal": {
-    "AWS": "arn:aws:iam::MAIN_ACCOUNT_ID:group/regulations-ingesters"
-  },
-  "Action": "es:*",
-  "Resource": "arn:aws:es:us-east-1:MAIN_ACCOUNT_ID:domain/DOMAIN_NAME/*"
-}
+For each user that needs access:
+
+1. Go to **Amazon OpenSearch Serverless** in the AWS console
+2. Click **Data access policies** in the left sidebar
+3. Click into the **`mirrulations-ingest`** policy
+4. Click **Edit**
+5. Click into the existing rule
+6. Scroll to **Grant access to** → **Add principals**
+7. Select **IAM users and roles**
+8. Paste the user's ARN: `arn:aws:iam::936771282063:user/USERNAME`
+9. Click **Save** on the principals
+10. Click **Save** on the rule
+11. Click **Save** on the policy
+
+> **Why `mirrulations-ingest` specifically?** This policy already has both
+> the required collection-level AND index-level permissions set up correctly:
+> - Collection: `aoss:CreateCollectionItems`, `aoss:DescribeCollectionItems`, etc.
+> - Index (`index/mirrulations/*`): `aoss:CreateIndex`, `aoss:DescribeIndex`,
+>   `aoss:ReadDocument`, `aoss:WriteDocument`
+>
+> A data access policy that only has index permissions but no collection
+> permissions will result in a `401` error even if credentials are correct.
+> Both levels are required.
+
+To find a user's ARN, have them run:
+```bash
+aws sts get-caller-identity
 ```
+The `Arn` field in the output is what to paste.
 
-4. Click **Save changes**
+---
 
-### 5. Map the group in OpenSearch Dashboards (if fine-grained access control is on)
+### Part B — For each user
 
-1. Open **OpenSearch Dashboards** (URL is on the domain page)
-2. Log in as the master user
-3. Go to **Security** → **Roles** → click `all_access`
-4. **Mapped users** tab → **Map users**
-5. Under **Backend roles** paste the group ARN:
-   `arn:aws:iam::MAIN_ACCOUNT_ID:group/regulations-ingesters`
-6. Click **Map**
+#### 5. Generate your own access keys
 
-### 6. Each user generates their own access keys
+Do this once in the main AWS account:
 
-Each person does this once in the main AWS account:
-
-1. Go to **IAM** → **Users** → click their username
+1. Go to **IAM** → **Users** → click your username
 2. **Security credentials** tab → **Create access key**
 3. Select **Application running outside AWS**
 4. Download or copy the **Access key ID** and **Secret access key**
 
 > **Note:** AWS only shows the secret access key once at creation time.
-> Save it immediately — if you lose it you will need to create a new key.
+> Save it immediately — if you lose it you will need to delete it and create a new one.
 
 ---
 

@@ -326,11 +326,6 @@ def process_document(data: dict, docket_id: str, session, os_client):
         url_suffix = Path(urlparse(url).path).stem
         doc_id_key = f"{document_id}-{url_suffix}" if len(html_urls) > 1 else document_id
 
-        # Check OpenSearch first — skip if already ingested
-        if document_exists_in_opensearch(os_client, doc_id_key):
-            log.info("Already in OpenSearch, skipping: %s", doc_id_key)
-            continue
-
         try:
             html_bytes = download_html(session, url)
             text       = extract_text(html_bytes)
