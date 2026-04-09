@@ -175,20 +175,38 @@ def list_dockets(s3, agency: str):
     return dockets
 
 
-def read_docket_json(s3, agency: str, docket_id: str):
+def list_document_jsons(s3, agency: str, docket_id: str):
     """
-    Read the docket JSON from:
-      s3://mirrulations/raw-data/<agency>/<docket-id>/text-<docket-id>/docket/<docket-id>.json
-    Returns parsed JSON or None if not found.
+    List all document JSON files under:
+      s3://mirrulations/raw-data/<agency>/<docket-id>/text-<docket-id>/documents/
+    Returns a list of S3 keys for each document JSON.
     """
-    key = f"{S3_PREFIX}/{agency}/{docket_id}/text-{docket_id}/docket/{docket_id}.json"
+    prefix    = f"{S3_PREFIX}/{agency}/{docket_id}/text-{docket_id}/documents/"
+    paginator = s3.get_paginator("list_objects_v2")
+    keys      = []
+
+    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            # Only grab .json files, not the .htm/.html content files
+            if key.endswith(".json"):
+                keys.append(key)
+
+    return keys
+
+
+def read_document_json(s3, key: str):
+    """
+    Read and parse a single document JSON from S3.
+    Returns parsed JSON or None on error.
+    """
     try:
         obj  = s3.get_object(Bucket=S3_BUCKET, Key=key)
         data = json.loads(obj["Body"].read().decode("utf-8"))
         return data
     except ClientError as e:
         if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
-            log.warning("Docket JSON not found: s3://%s/%s", S3_BUCKET, key)
+            log.warning("Document JSON not found: s3://%s/%s", S3_BUCKET, key)
             return None
         raise
     except json.JSONDecodeError as e:
@@ -281,51 +299,49 @@ def is_html_url(url: str) -> bool:
 # Process a single docket
 # ---------------------------------------------------------------------------
 
-def process_docket(docket_id: str, data: dict, session, os_client):
-    # Support both a list of records or a single record dict
-    records = data if isinstance(data, list) else [data]
+def process_document(data: dict, docket_id: str, session, os_client):
+    """
+    Process a single document JSON. Structure:
+    { "data": { "attributes": { "fileFormats": [...], ... }, "id": "DOC-ID" } }
+    """
+    attributes  = data.get("data", {}).get("attributes", {})
+    document_id = data.get("data", {}).get("id", "unknown-document")
+    rec_docket_id = attributes.get("docketId") or docket_id
 
-    # Reverse: newest first within each docket
-    records = list(reversed(records))
+    file_formats = attributes.get("fileFormats", [])
+    if not isinstance(file_formats, list):
+        file_formats = [file_formats]
 
-    for record in records:
-        rec_docket_id   = record.get("docketId")   or record.get("docket_id",   docket_id)
-        rec_document_id = record.get("documentId") or record.get("document_id", "unknown-document")
+    html_urls = [
+        fmt.get("fileUrl", "")
+        for fmt in file_formats
+        if is_html_url(fmt.get("fileUrl", ""))
+    ]
 
-        file_formats = record.get("fileFormats", [])
-        if not isinstance(file_formats, list):
-            file_formats = [file_formats]
+    if not html_urls:
+        log.debug("No HTML/HTM URLs for document '%s' — skipping", document_id)
+        return
 
-        html_urls = [
-            fmt.get("fileUrl") or fmt.get("file_url", "")
-            for fmt in file_formats
-            if is_html_url(fmt.get("fileUrl") or fmt.get("file_url", ""))
-        ]
+    for url in html_urls:
+        url_suffix = Path(urlparse(url).path).stem
+        doc_id_key = f"{document_id}-{url_suffix}" if len(html_urls) > 1 else document_id
 
-        if not html_urls:
-            log.debug("No HTML/HTM URLs for document '%s' — skipping", rec_document_id)
+        # Check OpenSearch first — skip if already ingested
+        if document_exists_in_opensearch(os_client, doc_id_key):
+            log.info("Already in OpenSearch, skipping: %s", doc_id_key)
             continue
 
-        for url in html_urls:
-            url_suffix = Path(urlparse(url).path).stem
-            doc_id_key = f"{rec_document_id}-{url_suffix}" if len(html_urls) > 1 else rec_document_id
+        try:
+            html_bytes = download_html(session, url)
+            text       = extract_text(html_bytes)
+            ingest_document(os_client, rec_docket_id, doc_id_key, text)
 
-            # Check OpenSearch first — skip if already ingested
-            if document_exists_in_opensearch(os_client, doc_id_key):
-                log.info("Already in OpenSearch, skipping: %s", doc_id_key)
-                continue
-
-            try:
-                html_bytes = download_html(session, url)
-                text       = extract_text(html_bytes)
-                ingest_document(os_client, rec_docket_id, doc_id_key, text)
-
-            except BlockedBySourceError:
-                pass  # already logged in detail
-            except requests.HTTPError as e:
-                log.error("HTTP error downloading %s: %s", url, e)
-            except Exception as e:
-                log.error("Unexpected error for document '%s': %s", doc_id_key, e)
+        except BlockedBySourceError:
+            pass  # already logged in detail
+        except requests.HTTPError as e:
+            log.error("HTTP error downloading %s: %s", url, e)
+        except Exception as e:
+            log.error("Unexpected error for document '%s': %s", doc_id_key, e)
 
 # ---------------------------------------------------------------------------
 # List all agencies in the bucket
@@ -394,11 +410,20 @@ def run(start: int, end: int):
         for d_idx, docket_id in enumerate(dockets, start=1):
             log.info("=== Docket %d / %d: %s ===", d_idx, len(dockets), docket_id)
 
-            data = read_docket_json(s3, agency, docket_id)
-            if data is None:
+            doc_keys = list_document_jsons(s3, agency, docket_id)
+            if not doc_keys:
+                log.warning("No document JSONs found for docket '%s' — skipping", docket_id)
                 continue
 
-            process_docket(docket_id, data, session, os_client)
+            # Reverse: newest documents first
+            doc_keys = list(reversed(doc_keys))
+            log.info("Found %d documents in docket %s", len(doc_keys), docket_id)
+
+            for doc_key in doc_keys:
+                data = read_document_json(s3, doc_key)
+                if data is None:
+                    continue
+                process_document(data, docket_id, session, os_client)
 
     log.info("Done. Processed agencies %d-%d.", start, end)
 
