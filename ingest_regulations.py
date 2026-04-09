@@ -129,28 +129,10 @@ def get_opensearch_client():
 
 def ensure_index(os_client):
     """
-    OpenSearch Serverless does not support HEAD requests (indices.exists),
-    so we just attempt to create the index and ignore the error if it
-    already exists.
+    OpenSearch Serverless auto-creates indexes on first write.
+    No need to explicitly create it — just log and move on.
     """
-    index = CONFIG["opensearch_index"]
-    mapping = {
-        "mappings": {
-            "properties": {
-                "docketId":     {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
-                "documentId":   {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
-                "documentText": {"type": "text"},
-            }
-        }
-    }
-    try:
-        os_client.indices.create(index=index, body=mapping)
-        log.info("Created OpenSearch index '%s'", index)
-    except Exception as e:
-        if "resource_already_exists_exception" in str(e).lower():
-            log.info("Index '%s' already exists — skipping creation", index)
-        else:
-            raise
+    log.info("Index '%s' will be created automatically on first write if needed", CONFIG["opensearch_index"])
 
 
 def document_exists_in_opensearch(os_client, document_id: str) -> bool:
