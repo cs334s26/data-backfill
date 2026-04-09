@@ -128,9 +128,12 @@ def get_opensearch_client():
 # ---------------------------------------------------------------------------
 
 def ensure_index(os_client):
+    """
+    OpenSearch Serverless does not support HEAD requests (indices.exists),
+    so we just attempt to create the index and ignore the error if it
+    already exists.
+    """
     index = CONFIG["opensearch_index"]
-    if os_client.indices.exists(index=index):
-        return
     mapping = {
         "mappings": {
             "properties": {
@@ -140,8 +143,14 @@ def ensure_index(os_client):
             }
         }
     }
-    os_client.indices.create(index=index, body=mapping)
-    log.info("Created OpenSearch index '%s'", index)
+    try:
+        os_client.indices.create(index=index, body=mapping)
+        log.info("Created OpenSearch index '%s'", index)
+    except Exception as e:
+        if "resource_already_exists_exception" in str(e).lower():
+            log.info("Index '%s' already exists — skipping creation", index)
+        else:
+            raise
 
 
 def document_exists_in_opensearch(os_client, document_id: str) -> bool:
