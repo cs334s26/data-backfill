@@ -315,7 +315,7 @@ def process_document(data: dict, docket_id: str, session, os_client):
     html_urls = [
         fmt.get("fileUrl", "")
         for fmt in file_formats
-        if is_html_url(fmt.get("fileUrl", ""))
+        if fmt and is_html_url(fmt.get("fileUrl", ""))
     ]
 
     if not html_urls:
@@ -421,6 +421,8 @@ def run(start: int, end: int):
                 process_document(data, docket_id, session, os_client)
 
     log.info("Done. Processed agencies %d-%d.", start, end)
+
+
 
 # ---------------------------------------------------------------------------
 # Entry point  —  $1 = start index, $2 = end index (1-based, inclusive)
