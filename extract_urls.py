@@ -36,7 +36,7 @@ AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 
 def is_html_url(url: str) -> bool:
     url_lower = url.lower()
-    return url_lower.endswith(".html") or url_lower.endswith(".htm")
+    return url_lower.endswith(".html")
 
 
 def list_agencies(s3) -> list:

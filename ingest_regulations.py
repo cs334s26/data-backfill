@@ -293,7 +293,7 @@ def extract_text(html_bytes: bytes) -> str:
 
 def is_html_url(url: str) -> bool:
     path = urlparse(url).path.lower()
-    return path.endswith(".html") or path.endswith(".htm")
+    return path.endswith(".html")
 
 # ---------------------------------------------------------------------------
 # Process a single docket
