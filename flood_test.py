@@ -158,6 +158,29 @@ def main():
     log.info("  Rate: ~%.1f requests/min", (success / elapsed * 60) if elapsed > 0 else 0)
     log.info("=" * 60)
 
+    # Auto-terminate the EC2 instance when the test is done
+    try:
+        import urllib.request
+        import boto3
+        token_req = urllib.request.Request(
+            "http://169.254.169.254/latest/api/token",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
+            method="PUT"
+        )
+        token = urllib.request.urlopen(token_req, timeout=2).read().decode()
+        instance_id_req = urllib.request.Request(
+            "http://169.254.169.254/latest/meta-data/instance-id",
+            headers={"X-aws-ec2-metadata-token": token}
+        )
+        instance_id = urllib.request.urlopen(instance_id_req, timeout=2).read().decode()
+        log.info("Terminating EC2 instance %s...", instance_id)
+        ec2 = boto3.client("ec2", region_name="us-east-1")
+        ec2.terminate_instances(InstanceIds=[instance_id])
+        log.info("Termination request sent. Goodbye!")
+    except Exception as e:
+        log.warning("Could not auto-terminate instance: %s", e)
+        log.warning("Please terminate the instance manually in the EC2 console.")
+
 
 if __name__ == "__main__":
     main()
