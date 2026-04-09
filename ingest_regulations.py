@@ -4,31 +4,28 @@ ingest_regulations.py
 
 Usage (bash):
   chmod +x ingest_regulations.py
-  ./ingest_regulations.py <path-to-json-file> [start] [end]
+  ./ingest_regulations.py <agency>
 
 Arguments:
-  $1  path-to-json-file   Required. Path to the input JSON file.
-  $2  start               Optional. Index to start from (0-based, default: 0).
-  $3  end                 Optional. Index to stop at, exclusive (default: end of file).
+  $1  agency   Required. The agency prefix to process (e.g. CMS, EPA, FDA).
+               This maps to s3://mirrulations/raw-data/<agency>/
 
-Examples:
-  ./ingest_regulations.py docs.json            # process all records
-  ./ingest_regulations.py docs.json 0 500      # process records 0-499
-  ./ingest_regulations.py docs.json 500 1000   # process records 500-999
+The script walks every docket under the agency, reads the docket JSON from
+  s3://mirrulations/raw-data/<agency>/<docket-id>/text-<docket-id>/docket/<docket-id>.json
+and for each HTML/HTM URL found:
+  1. Checks if the document is already in OpenSearch (skips if so)
+  2. Downloads the HTML from regulations.gov
+  3. Ingests the parsed text into OpenSearch index: documents_text
 
-Records within the selected range are processed in REVERSE order (newest first).
+Records within each docket are processed in REVERSE order (newest first).
 
 Required environment variables:
-  OPENSEARCH_HOST        e.g. https://search-my-domain.us-east-1.es.amazonaws.com
-  OPENSEARCH_USER        basic auth username
-  OPENSEARCH_PASSWORD    basic auth password
-
-Optional S3 environment variables (only needed when USE_S3=true):
-  USE_S3                 Set to "true" to enable S3 storage (default: false)
   AWS_ACCESS_KEY_ID
   AWS_SECRET_ACCESS_KEY
   AWS_REGION             (default: us-east-1)
-  S3_BUCKET_NAME
+  OPENSEARCH_HOST        e.g. https://search-my-domain.us-east-1.es.amazonaws.com
+  OPENSEARCH_USER        basic auth username
+  OPENSEARCH_PASSWORD    basic auth password
 """
 
 import datetime
@@ -39,9 +36,11 @@ import logging
 from pathlib import Path
 from urllib.parse import urlparse
 
+import boto3
 import requests
+from botocore.exceptions import ClientError
 from bs4 import BeautifulSoup
-from opensearchpy import OpenSearch, RequestsHttpConnection
+from opensearchpy import OpenSearch, RequestsHttpConnection, NotFoundError
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -58,16 +57,15 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-USE_S3 = os.getenv("USE_S3", "false").lower() == "true"
+S3_BUCKET = "mirrulations"
+S3_PREFIX = "raw-data"
 
 CONFIG = {
     "opensearch_host":     os.getenv("OPENSEARCH_HOST", "https://localhost:9200"),
     "opensearch_index":    "documents_text",   # hardcoded — do not change
     "opensearch_user":     os.getenv("OPENSEARCH_USER", "admin"),
     "opensearch_password": os.getenv("OPENSEARCH_PASSWORD", "admin"),
-    # S3 — only used when USE_S3=true
     "aws_region":          os.getenv("AWS_REGION", "us-east-1"),
-    "s3_bucket":           os.getenv("S3_BUCKET_NAME", ""),
 }
 
 HEADERS = {
@@ -99,6 +97,13 @@ class BlockedBySourceError(Exception):
     pass
 
 # ---------------------------------------------------------------------------
+# AWS clients
+# ---------------------------------------------------------------------------
+
+def get_s3_client():
+    return boto3.client("s3", region_name=CONFIG["aws_region"])
+
+# ---------------------------------------------------------------------------
 # OpenSearch client
 # ---------------------------------------------------------------------------
 
@@ -117,32 +122,85 @@ def get_opensearch_client():
     )
 
 # ---------------------------------------------------------------------------
-# S3 helpers  (only imported / used when USE_S3=true)
+# OpenSearch helpers
 # ---------------------------------------------------------------------------
 
-def get_s3_client():
-    import boto3
-    return boto3.client("s3", region_name=CONFIG["aws_region"])
+def ensure_index(os_client):
+    index = CONFIG["opensearch_index"]
+    if os_client.indices.exists(index=index):
+        return
+    mapping = {
+        "mappings": {
+            "properties": {
+                "docketId":     {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
+                "documentId":   {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
+                "documentText": {"type": "text"},
+            }
+        }
+    }
+    os_client.indices.create(index=index, body=mapping)
+    log.info("Created OpenSearch index '%s'", index)
 
 
-def s3_key_for_document(document_id: str) -> str:
-    return f"html/{document_id}.html"
-
-
-def file_exists_in_s3(s3, bucket: str, key: str) -> bool:
-    from botocore.exceptions import ClientError
+def document_exists_in_opensearch(os_client, document_id: str) -> bool:
+    """Check if a document is already ingested by its ID."""
     try:
-        s3.head_object(Bucket=bucket, Key=key)
+        os_client.get(index=CONFIG["opensearch_index"], id=document_id)
         return True
+    except NotFoundError:
+        return False
+
+
+def ingest_document(os_client, docket_id: str, document_id: str, text: str):
+    doc = {
+        "docketId":     docket_id,
+        "documentId":   document_id,
+        "documentText": text,
+    }
+    os_client.index(index=CONFIG["opensearch_index"], id=document_id, body=doc)
+    log.info("Ingested '%s' → OpenSearch index '%s'", document_id, CONFIG["opensearch_index"])
+
+# ---------------------------------------------------------------------------
+# S3 helpers
+# ---------------------------------------------------------------------------
+
+def list_dockets(s3, agency: str) -> list[str]:
+    """
+    List all docket IDs under s3://mirrulations/raw-data/<agency>/
+    Returns a list of docket ID strings e.g. ['CMS-2026-1420', ...]
+    """
+    prefix   = f"{S3_PREFIX}/{agency}/"
+    paginator = s3.get_paginator("list_objects_v2")
+    dockets  = []
+
+    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix, Delimiter="/"):
+        for cp in page.get("CommonPrefixes", []):
+            # cp["Prefix"] looks like "raw-data/CMS/CMS-2026-1420/"
+            docket_id = cp["Prefix"].rstrip("/").split("/")[-1]
+            dockets.append(docket_id)
+
+    return dockets
+
+
+def read_docket_json(s3, agency: str, docket_id: str) -> dict | None:
+    """
+    Read the docket JSON from:
+      s3://mirrulations/raw-data/<agency>/<docket-id>/text-<docket-id>/docket/<docket-id>.json
+    Returns parsed JSON or None if not found.
+    """
+    key = f"{S3_PREFIX}/{agency}/{docket_id}/text-{docket_id}/docket/{docket_id}.json"
+    try:
+        obj  = s3.get_object(Bucket=S3_BUCKET, Key=key)
+        data = json.loads(obj["Body"].read().decode("utf-8"))
+        return data
     except ClientError as e:
-        if e.response["Error"]["Code"] == "404":
-            return False
+        if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
+            log.warning("Docket JSON not found: s3://%s/%s", S3_BUCKET, key)
+            return None
         raise
-
-
-def upload_to_s3(s3, bucket: str, key: str, content: bytes):
-    s3.put_object(Bucket=bucket, Key=key, Body=content, ContentType="text/html")
-    log.info("Uploaded s3://%s/%s", bucket, key)
+    except json.JSONDecodeError as e:
+        log.error("Failed to parse JSON at s3://%s/%s: %s", S3_BUCKET, key, e)
+        return None
 
 # ---------------------------------------------------------------------------
 # HTTP session
@@ -194,13 +252,13 @@ def check_if_blocked(resp: requests.Response, url: str) -> bool:
         log.warning("  URL:    %s", url)
         log.warning("  Reason: %s", reason)
         log.warning("  Time:   %s", datetime.datetime.now().isoformat())
-        log.warning("  Action: skipping this document — not uploaded or ingested")
+        log.warning("  Action: skipping this document — not ingested")
         log.warning("=" * 60)
 
     return blocked
 
 # ---------------------------------------------------------------------------
-# Download
+# Download + parse
 # ---------------------------------------------------------------------------
 
 def download_html(session, url: str) -> bytes:
@@ -211,44 +269,12 @@ def download_html(session, url: str) -> bytes:
     resp.raise_for_status()
     return resp.content
 
-# ---------------------------------------------------------------------------
-# Parse
-# ---------------------------------------------------------------------------
 
 def extract_text(html_bytes: bytes) -> str:
     soup = BeautifulSoup(html_bytes, "html.parser")
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
     return " ".join(soup.get_text(separator=" ").split())
-
-# ---------------------------------------------------------------------------
-# OpenSearch ingestion
-# ---------------------------------------------------------------------------
-
-def ensure_index(os_client, index: str):
-    if os_client.indices.exists(index=index):
-        return
-    mapping = {
-        "mappings": {
-            "properties": {
-                "docketId":     {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
-                "documentId":   {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
-                "documentText": {"type": "text"},
-            }
-        }
-    }
-    os_client.indices.create(index=index, body=mapping)
-    log.info("Created OpenSearch index '%s'", index)
-
-
-def ingest_document(os_client, index: str, docket_id: str, document_id: str, text: str):
-    doc = {
-        "docketId":     docket_id,
-        "documentId":   document_id,
-        "documentText": text,
-    }
-    os_client.index(index=index, id=document_id, body=doc)
-    log.info("Ingested '%s' → OpenSearch index '%s'", document_id, index)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -259,52 +285,19 @@ def is_html_url(url: str) -> bool:
     return path.endswith(".html") or path.endswith(".htm")
 
 # ---------------------------------------------------------------------------
-# Main processing
+# Process a single docket
 # ---------------------------------------------------------------------------
 
-def process_json_file(json_path: str, start: int, end: int | None):
-    log.info("Reading input file: %s", json_path)
-    with open(json_path, "r", encoding="utf-8") as f:
-        records = json.load(f)
+def process_docket(docket_id: str, data: dict, session, os_client):
+    # Support both a list of records or a single record dict
+    records = data if isinstance(data, list) else [data]
 
-    if isinstance(records, dict):
-        records = [records]
+    # Reverse: newest first within each docket
+    records = list(reversed(records))
 
-    total_records = len(records)
-
-    # Validate range
-    if start < 0 or start >= total_records:
-        log.error("start index %d is out of range (file has %d records)", start, total_records)
-        sys.exit(1)
-
-    if end is None:
-        end = total_records
-    elif end > total_records:
-        log.warning("end index %d exceeds file length — clamping to %d", end, total_records)
-        end = total_records
-
-    # Slice then reverse: newest-first within the selected range
-    slice_  = records[start:end]
-    slice_  = list(reversed(slice_))
-    count   = len(slice_)
-
-    log.info(
-        "Range: records %d–%d  (%d records) out of %d total — processing newest first",
-        start, end - 1, count, total_records
-    )
-    log.info("S3 storage: %s", "ENABLED" if USE_S3 else "DISABLED (set USE_S3=true to enable)")
-
-    os_client = get_opensearch_client()
-    session   = get_http_session()
-    s3        = get_s3_client() if USE_S3 else None
-
-    ensure_index(os_client, CONFIG["opensearch_index"])
-
-    for idx, record in enumerate(slice_, start=1):
-        log.info("--- Record %d / %d  (file index %d) ---", idx, count, end - idx)
-
-        docket_id   = record.get("docketId")   or record.get("docket_id",   "unknown-docket")
-        document_id = record.get("documentId") or record.get("document_id", "unknown-document")
+    for record in records:
+        rec_docket_id   = record.get("docketId")   or record.get("docket_id",   docket_id)
+        rec_document_id = record.get("documentId") or record.get("document_id", "unknown-document")
 
         file_formats = record.get("fileFormats", [])
         if not isinstance(file_formats, list):
@@ -317,68 +310,77 @@ def process_json_file(json_path: str, start: int, end: int | None):
         ]
 
         if not html_urls:
-            log.warning("No HTML/HTM URLs found for document '%s' — skipping", document_id)
+            log.debug("No HTML/HTM URLs for document '%s' — skipping", rec_document_id)
             continue
 
         for url in html_urls:
             url_suffix = Path(urlparse(url).path).stem
-            doc_id_key = f"{document_id}-{url_suffix}" if len(html_urls) > 1 else document_id
+            doc_id_key = f"{rec_document_id}-{url_suffix}" if len(html_urls) > 1 else rec_document_id
+
+            # Check OpenSearch first — skip if already ingested
+            if document_exists_in_opensearch(os_client, doc_id_key):
+                log.info("Already in OpenSearch, skipping: %s", doc_id_key)
+                continue
 
             try:
-                html_bytes = None
-
-                if USE_S3:
-                    s3_key = s3_key_for_document(doc_id_key)
-                    if file_exists_in_s3(s3, CONFIG["s3_bucket"], s3_key):
-                        log.info("Already in S3, loading from cache: %s", s3_key)
-                        obj        = s3.get_object(Bucket=CONFIG["s3_bucket"], Key=s3_key)
-                        html_bytes = obj["Body"].read()
-                    else:
-                        html_bytes = download_html(session, url)
-                        upload_to_s3(s3, CONFIG["s3_bucket"], s3_key, html_bytes)
-                else:
-                    html_bytes = download_html(session, url)
-
-                text = extract_text(html_bytes)
-                ingest_document(os_client, CONFIG["opensearch_index"], docket_id, doc_id_key, text)
+                html_bytes = download_html(session, url)
+                text       = extract_text(html_bytes)
+                ingest_document(os_client, rec_docket_id, doc_id_key, text)
 
             except BlockedBySourceError:
-                pass  # already logged in detail by check_if_blocked()
+                pass  # already logged in detail
             except requests.HTTPError as e:
                 log.error("HTTP error downloading %s: %s", url, e)
             except Exception as e:
                 log.error("Unexpected error for document '%s': %s", doc_id_key, e)
 
-    log.info("Done. Processed %d records (file range %d–%d).", count, start, end - 1)
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def run(agency: str):
+    log.info("Starting ingestion for agency: %s", agency)
+    log.info("Bucket: s3://%s/%s/%s/", S3_BUCKET, S3_PREFIX, agency)
+
+    s3        = get_s3_client()
+    os_client = get_opensearch_client()
+    session   = get_http_session()
+
+    ensure_index(os_client)
+
+    log.info("Listing dockets for agency '%s'...", agency)
+    dockets = list_dockets(s3, agency)
+
+    if not dockets:
+        log.warning("No dockets found for agency '%s' — check the agency name and bucket structure", agency)
+        sys.exit(1)
+
+    total = len(dockets)
+    log.info("Found %d dockets", total)
+
+    for idx, docket_id in enumerate(dockets, start=1):
+        log.info("=== Docket %d / %d: %s ===", idx, total, docket_id)
+
+        data = read_docket_json(s3, agency, docket_id)
+        if data is None:
+            continue
+
+        process_docket(docket_id, data, session, os_client)
+
+    log.info("Done. Processed %d dockets for agency '%s'.", total, agency)
 
 # ---------------------------------------------------------------------------
-# Entry point  —  filename passed as $1 (bash convention)
+# Entry point  —  agency passed as $1 (bash convention)
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: ./ingest_regulations.py <path-to-json-file> [start] [end]")
-        print("  $1  path-to-json-file")
-        print("  $2  start index, 0-based (default: 0)")
-        print("  $3  end index, exclusive  (default: end of file)")
+        print("Usage: ./ingest_regulations.py <agency>")
+        print("  $1  agency code, e.g. CMS, EPA, FDA")
+        print()
+        print("  Processes all dockets under:")
+        print("  s3://mirrulations/raw-data/<agency>/")
         sys.exit(1)
 
-    filename = sys.argv[1]  # $1
-
-    if not os.path.isfile(filename):
-        print(f"Error: file not found: {filename}")
-        sys.exit(1)
-
-    try:
-        start = int(sys.argv[2]) if len(sys.argv) > 2 else 0
-    except ValueError:
-        print(f"Error: start index must be an integer, got '{sys.argv[2]}'")
-        sys.exit(1)
-
-    try:
-        end = int(sys.argv[3]) if len(sys.argv) > 3 else None
-    except ValueError:
-        print(f"Error: end index must be an integer, got '{sys.argv[3]}'")
-        sys.exit(1)
-
-    process_json_file(filename, start, end)
+    agency = sys.argv[1].strip()
+    run(agency)

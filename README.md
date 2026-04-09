@@ -1,13 +1,28 @@
 # Regulations Ingester
 
-Downloads HTML documents from `regulations.gov`, optionally stores them in S3,
-and ingests the parsed text into an AWS OpenSearch index called `documents_text`.
+Downloads HTML documents from `regulations.gov` and ingests the parsed text
+into an AWS OpenSearch index called `documents_text`.
 
-To backfill with multiple EC2 instances at once, each instance is given a
-**slice** of the JSON file via `start` and `end` arguments. There is no
-coordination service needed — OpenSearch upserts by document ID, so even if
-two instances accidentally overlap on the same record, no duplicates or
-corruption occur.
+The script reads docket JSON files directly from the S3 bucket
+`s3://mirrulations/raw-data/` and checks OpenSearch before downloading
+anything — so documents that are already ingested are automatically skipped.
+
+Each person runs the script with one or more **agency codes** (e.g. `CMS`,
+`EPA`, `FDA`). The script walks every docket under that agency automatically.
+
+---
+
+## How it works
+
+```
+S3: s3://mirrulations/raw-data/<agency>/<docket-id>/text-<docket-id>/docket/<docket-id>.json
+        ↓ read JSON
+        ↓ find HTML URLs in fileFormats
+        ↓ check OpenSearch — skip if already ingested
+        ↓ download HTML from regulations.gov
+        ↓ parse text
+        ↓ ingest into OpenSearch (documents_text)
+```
 
 ---
 
@@ -39,7 +54,7 @@ set up a shared IAM group so permissions are managed in one place.
 2. Go to the **Users** tab → **Add users**
 3. Select all 20 users and click **Add users**
 
-### 3. Attach an OpenSearch permission policy to the group
+### 3. Attach permissions to the group
 
 1. Click into the group → **Permissions** tab
 2. Click **Add permissions** → **Create inline policy**
@@ -53,13 +68,24 @@ set up a shared IAM group so permissions are managed in one place.
       "Effect": "Allow",
       "Action": "es:*",
       "Resource": "arn:aws:es:us-east-1:MAIN_ACCOUNT_ID:domain/DOMAIN_NAME/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::mirrulations",
+        "arn:aws:s3:::mirrulations/*"
+      ]
     }
   ]
 }
 ```
 
 4. Replace `MAIN_ACCOUNT_ID` and `DOMAIN_NAME` with the real values
-5. Name the policy `opensearch-ingest-access` → **Create policy**
+5. Name the policy `regulations-ingester-access` → **Create policy**
 
 ### 4. Add the group to the OpenSearch access policy
 
@@ -67,7 +93,7 @@ The domain owner needs to do this:
 
 1. Go to **Amazon OpenSearch Service** → click the domain
 2. **Security configuration** tab → **Access policy** → **Edit**
-3. Add this statement (replacing the ARN with the real group ARN):
+3. Add this statement:
 
 ```json
 {
@@ -101,6 +127,9 @@ Each person does this once in the main AWS account:
 3. Select **Application running outside AWS**
 4. Download or copy the **Access key ID** and **Secret access key**
 
+> **Note:** AWS only shows the secret access key once at creation time.
+> Save it immediately — if you lose it you will need to create a new key.
+
 ---
 
 ## EC2 Instance Setup (each person does this on their own instance)
@@ -133,15 +162,14 @@ chmod 400 your-key.pem
 ```bash
 sudo yum update -y
 sudo yum install -y python3-pip git
-pip3 install requests beautifulsoup4 opensearch-py urllib3
+pip3 install requests beautifulsoup4 opensearch-py urllib3 boto3
 ```
 
-### Step 4 — Copy the script and JSON file onto the instance
+### Step 4 — Copy the script onto the instance
 
 Run this from your **local machine**:
 ```bash
 scp -i your-key.pem ingest_regulations.py ec2-user@YOUR_INSTANCE_IP:~/
-scp -i your-key.pem docs.json ec2-user@YOUR_INSTANCE_IP:~/
 ```
 
 Or if the script is in a git repo:
@@ -157,18 +185,18 @@ Create a `.env` file in your home directory to store your credentials:
 nano ~/.env
 ```
 
-Paste the following into the file, filling in your real values:
+Paste the following, filling in your real values:
 
 ```bash
-# Required
+# AWS credentials
 export AWS_ACCESS_KEY_ID=your-access-key
 export AWS_SECRET_ACCESS_KEY=your-secret-key
 export AWS_REGION=us-east-1
-export OPENSEARCH_HOST=https://the-domain-endpoint
 
-# Optional — only needed if USE_S3=true
-# export USE_S3=true
-# export S3_BUCKET_NAME=my-regulations-bucket
+# OpenSearch — use the standard endpoint (not the FIPS one)
+export OPENSEARCH_HOST=https://your-domain.us-east-1.es.amazonaws.com
+export OPENSEARCH_USER=your-opensearch-username
+export OPENSEARCH_PASSWORD=your-opensearch-password
 ```
 
 Save and close the file (`Ctrl+O`, `Enter`, `Ctrl+X` in nano).
@@ -183,7 +211,7 @@ Load the variables into your session:
 source ~/.env
 ```
 
-To make this automatic on every login so you never have to run `source` manually, add it to `~/.bashrc`:
+To load automatically on every login:
 ```bash
 echo 'source ~/.env' >> ~/.bashrc
 ```
@@ -200,7 +228,7 @@ echo $AWS_ACCESS_KEY_ID
 chmod +x ingest_regulations.py
 
 # Test OpenSearch is reachable
-curl "$OPENSEARCH_HOST/_cat/indices?v"
+curl -u "$OPENSEARCH_USER:$OPENSEARCH_PASSWORD" "$OPENSEARCH_HOST/_cat/indices?v"
 ```
 
 A successful response shows a list of indices. A `403` means permissions
@@ -211,68 +239,55 @@ aren't applied yet. `connection refused` means the host URL is wrong.
 ## Usage
 
 ```
-./ingest_regulations.py <file> [start] [end]
+./ingest_regulations.py <agency>
 ```
 
 | Argument | Required | Description |
 |---|---|---|
-| `$1` file | Yes | Path to the input JSON file |
-| `$2` start | No | First record index to process, 0-based (default: `0`) |
-| `$3` end | No | Record index to stop at, **exclusive** (default: end of file) |
+| `$1` agency | Yes | Agency code to process, e.g. `CMS`, `EPA`, `FDA` |
 
-Within the selected range, records are always processed **newest first**
-(reverse order), so the most recent data is ingested before older data.
+The script walks **all dockets** under that agency automatically:
+```
+s3://mirrulations/raw-data/<agency>/
+```
+
+Within each docket, records are processed **newest first**.
 
 ### Examples
 
-Process the entire file:
+Process all CMS dockets:
 ```bash
-./ingest_regulations.py docs.json
+./ingest_regulations.py CMS
 ```
 
-Process records 0 through 499:
+Process all EPA dockets:
 ```bash
-./ingest_regulations.py docs.json 0 500
-```
-
-Process records 500 through 999:
-```bash
-./ingest_regulations.py docs.json 500 1000
+./ingest_regulations.py EPA
 ```
 
 ---
 
 ## Running on multiple EC2 instances
 
-### Step 1 — Find the total record count
+With 300 agencies and 20 people, divide the agencies between instances.
+Coordinate who runs which agency beforehand to avoid overlap.
 
-Run this once on any instance:
-```bash
-python3 -c "import json; f=open('docs.json'); d=json.load(f); print(len(d))"
-```
-Example output: `3000`
+Example split:
 
-### Step 2 — Divide the range evenly
-
-With 3000 records and 20 people, each person gets 150 records:
-
-| Person | Command |
+| Person | Agencies |
 |---|---|
-| Person 1 | `./ingest_regulations.py docs.json 0 150` |
-| Person 2 | `./ingest_regulations.py docs.json 150 300` |
-| Person 3 | `./ingest_regulations.py docs.json 300 450` |
+| Person 1 | `CMS` `EPA` ... |
+| Person 2 | `FDA` `DOT` ... |
 | ... | ... |
-| Person 20 | `./ingest_regulations.py docs.json 2850 3000` |
 
-### Step 3 — Run with nohup so it keeps going if SSH drops
-
+Run in the background so it keeps going if SSH drops:
 ```bash
-nohup ./ingest_regulations.py docs.json 0 150 > my_run.log 2>&1 &
+nohup ./ingest_regulations.py CMS > cms_run.log 2>&1 &
 ```
 
 Check progress:
 ```bash
-tail -f my_run.log
+tail -f cms_run.log
 ```
 
 Check if it's still running:
@@ -280,13 +295,21 @@ Check if it's still running:
 ps aux | grep ingest
 ```
 
+To run multiple agencies back to back:
+```bash
+for agency in CMS EPA FDA DOT; do
+    ./ingest_regulations.py $agency >> all_runs.log 2>&1
+done
+```
+
 ---
 
-## What happens if ranges overlap?
+## What happens if a document is already ingested?
 
-It is safe to overlap ranges. OpenSearch uses the `documentId` as the document
-ID, which means writes are **upserts** — the last writer wins but the data is
-identical, so there are no duplicates or corruption.
+Before downloading anything the script checks OpenSearch by document ID. If
+the document is already there it logs `Already in OpenSearch, skipping` and
+moves on. This means it is safe to re-run the script on the same agency or
+have two people accidentally overlap — no duplicates will be created.
 
 ---
 
@@ -302,7 +325,7 @@ BLOCKED BY REGULATIONS.GOV
   URL:    https://downloads.regulations.gov/.../content.html
   Reason: HTTP 429 Too Many Requests (Retry-After: 60s)
   Time:   2026-04-08T14:32:01.123456
-  Action: skipping this document — not uploaded or ingested
+  Action: skipping this document — not ingested
 ============================================================
 ```
 
@@ -310,16 +333,31 @@ If you are getting blocked frequently, run fewer instances at once.
 
 ---
 
+## S3 bucket structure expected
+
+```
+s3://mirrulations/raw-data/
+  <agency>/                          e.g. CMS/
+    <docket-id>/                     e.g. CMS-2026-1420/
+      text-<docket-id>/
+        docket/
+          <docket-id>.json           e.g. CMS-2026-1420.json
+```
+
+---
+
 ## Input JSON format
+
+Each docket JSON should contain document metadata including HTML file URLs:
 
 ```json
 [
   {
-    "docketId":   "EPA-HQ-OAR-2021-0257",
-    "documentId": "EPA-HQ-OAR-2021-0257-0001",
+    "docketId":   "CMS-2026-1420",
+    "documentId": "CMS-2026-1420-0001",
     "fileFormats": [
       {
-        "fileUrl": "https://downloads.regulations.gov/EPA-HQ-OAR-2021-0257-0001/content.html"
+        "fileUrl": "https://downloads.regulations.gov/CMS-2026-1420-0001/content.html"
       }
     ]
   }
@@ -337,8 +375,8 @@ Documents are always written to the `documents_text` index with this shape:
 
 ```json
 {
-  "docketId":     "EPA-HQ-OAR-2021-0257",
-  "documentId":   "EPA-HQ-OAR-2021-0257-0001",
+  "docketId":     "CMS-2026-1420",
+  "documentId":   "CMS-2026-1420-0001",
   "documentText": "Full parsed plain text of the HTML document..."
 }
 ```
@@ -347,39 +385,23 @@ The index is created automatically if it does not exist.
 
 ---
 
-## S3 storage (optional)
-
-When `USE_S3=true`, raw HTML files are stored in S3 at:
-```
-s3://<S3_BUCKET_NAME>/html/<documentId>.html
-```
-
-On subsequent runs, if the file already exists in S3 it is loaded from there
-instead of re-downloading from `regulations.gov`, saving bandwidth and reducing
-the chance of being blocked.
-
-S3 is **disabled by default**. To enable it:
-```bash
-export USE_S3=true
-export S3_BUCKET_NAME=my-regulations-bucket
-```
-
----
-
 ## Troubleshooting
 
 **`connection refused` or can't reach OpenSearch**
-Verify the `OPENSEARCH_HOST` URL and that your EC2 security group allows
-outbound traffic on port 443.
+Verify `OPENSEARCH_HOST` is the standard endpoint (not the FIPS one) and
+that port 443 is open in your EC2 security group.
 
 **`403 Forbidden` from OpenSearch**
 Your IAM user is not in the `regulations-ingesters` group, or the OpenSearch
 access policy hasn't been updated yet. Check with whoever manages the domain.
 
-**`No HTML/HTM URLs found for document`**
-That record's `fileFormats` has no `.html` or `.htm` link. Expected for
-PDF-only documents — the record is skipped automatically.
+**`No dockets found for agency`**
+The agency code is wrong or doesn't exist in the bucket. Check the exact
+folder names in `s3://mirrulations/raw-data/` and use the folder name as `$1`.
 
-**Script exits immediately with a range error**
-Your `start` index is >= the number of records in the file. Re-check the
-record count and adjust your range.
+**`Docket JSON not found`**
+The expected JSON path doesn't exist for that docket. The docket is skipped
+automatically and the script moves on to the next one.
+
+**`Permissions 0644 for key file are too open`**
+Run `chmod 400 your-key.pem` before SSH-ing in.
