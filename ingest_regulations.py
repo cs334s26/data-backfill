@@ -299,14 +299,30 @@ def is_html_url(url: str) -> bool:
 # Process a single docket
 # ---------------------------------------------------------------------------
 
-def process_document(data: dict, docket_id: str, session, os_client):
+def process_document(data: dict, docket_id: str, session, os_client, since_date=None):
     """
     Process a single document JSON. Structure:
     { "data": { "attributes": { "fileFormats": [...], ... }, "id": "DOC-ID" } }
+
+    If since_date is provided (datetime.date), only documents posted on or
+    after that date will be processed.
     """
-    attributes  = data.get("data", {}).get("attributes", {})
-    document_id = data.get("data", {}).get("id", "unknown-document")
+    attributes    = data.get("data", {}).get("attributes", {})
+    document_id   = data.get("data", {}).get("id", "unknown-document")
     rec_docket_id = attributes.get("docketId") or docket_id
+
+    # Filter by postedDate if --since was specified
+    if since_date is not None:
+        posted_raw = attributes.get("postedDate") or attributes.get("modifyDate")
+        if posted_raw:
+            try:
+                posted = datetime.date.fromisoformat(posted_raw[:10])
+                if posted < since_date:
+                    log.debug("Skipping '%s' — posted %s is before --since %s",
+                              document_id, posted, since_date)
+                    return
+            except ValueError:
+                pass  # if date can't be parsed, process it anyway
 
     file_formats = attributes.get("fileFormats", [])
     if not isinstance(file_formats, list):
@@ -362,7 +378,7 @@ def list_agencies(s3):
 # Main
 # ---------------------------------------------------------------------------
 
-def run(start: int, end: int):
+def run(start: int, end: int, since_date=None):
     s3        = get_s3_client()
     os_client = get_opensearch_client()
     session   = get_http_session()
@@ -391,6 +407,8 @@ def run(start: int, end: int):
 
     selected = agencies[start - 1:end]  # convert 1-based to 0-based slice
     log.info("Processing agencies %d-%d: %s", start, end, ", ".join(selected))
+    if since_date:
+        log.info("Filtering to documents posted on or after: %s", since_date)
 
     for agency_idx, agency in enumerate(selected, start=start):
         log.info("*** Agency %d / %d: %s ***", agency_idx, total_agencies, agency)
@@ -418,7 +436,7 @@ def run(start: int, end: int):
                 data = read_document_json(s3, doc_key)
                 if data is None:
                     continue
-                process_document(data, docket_id, session, os_client)
+                process_document(data, docket_id, session, os_client, since_date=since_date)
 
     log.info("Done. Processed agencies %d-%d.", start, end)
 
@@ -429,32 +447,31 @@ def run(start: int, end: int):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: ./ingest_regulations.py <start> [end]")
-        print()
-        print("  $1  start   Agency index to start from (1-based)")
-        print("  $2  end     Agency index to stop at, inclusive (default: same as start)")
-        print()
-        print("  Agencies are the folders found in s3://mirrulations/raw-data/")
-        print()
-        print("  Examples:")
-        print("    ./ingest_regulations.py 1        # process agency #1 only")
-        print("    ./ingest_regulations.py 1 15     # process agencies 1 through 15")
-        print("    ./ingest_regulations.py 16 30    # process agencies 16 through 30")
-        print()
-        print("  Tip: run with any number to see the full numbered agency list first.")
-        sys.exit(1)
+    import argparse
 
-    try:
-        start = int(sys.argv[1])
-    except ValueError:
-        print(f"Error: start must be an integer, got '{sys.argv[1]}'")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="Ingest regulations.gov HTML documents into OpenSearch."
+    )
+    parser.add_argument("start", type=int,
+                        help="Agency index to start from (1-based)")
+    parser.add_argument("end", type=int, nargs="?", default=None,
+                        help="Agency index to stop at, inclusive (default: same as start)")
+    parser.add_argument("--since", type=str, default=None,
+                        metavar="YYYY-MM-DD",
+                        help="Only process documents posted on or after this date")
 
-    try:
-        end = int(sys.argv[2]) if len(sys.argv) > 2 else start
-    except ValueError:
-        print(f"Error: end must be an integer, got '{sys.argv[2]}'")
-        sys.exit(1)
+    args = parser.parse_args()
 
-    run(start, end)
+    start = args.start
+    end   = args.end if args.end is not None else start
+
+    since_date = None
+    if args.since:
+        try:
+            since_date = datetime.date.fromisoformat(args.since)
+            print(f"Filtering to documents posted on or after: {since_date}")
+        except ValueError:
+            print(f"Error: --since date must be in YYYY-MM-DD format, got '{args.since}'")
+            sys.exit(1)
+
+    run(start, end, since_date=since_date)
