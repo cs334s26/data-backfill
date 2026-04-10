@@ -57,8 +57,9 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-S3_BUCKET = "mirrulations"
-S3_PREFIX = "raw-data"
+S3_BUCKET       = "mirrulations"
+S3_PREFIX       = "raw-data"
+LOCAL_DATA_PATH = os.getenv("LOCAL_DATA_PATH", "")  # e.g. /Users/eisenhardtj/data
 
 CONFIG = {
     "opensearch_host":  os.getenv("OPENSEARCH_HOST", ""),
@@ -211,6 +212,63 @@ def read_document_json(s3, key: str):
         raise
     except json.JSONDecodeError as e:
         log.error("Failed to parse JSON at s3://%s/%s: %s", S3_BUCKET, key, e)
+        return None
+
+# ---------------------------------------------------------------------------
+# Local file helpers (used when LOCAL_DATA_PATH is set)
+# ---------------------------------------------------------------------------
+
+def list_agencies_local():
+    """List agency folders from local data directory using os.walk."""
+    data_path = LOCAL_DATA_PATH
+    try:
+        return sorted([
+            name for name in os.listdir(data_path)
+            if os.path.isdir(os.path.join(data_path, name))
+        ])
+    except OSError as e:
+        log.error("Cannot read local data path %s: %s", data_path, e)
+        return []
+
+
+def list_dockets_local(agency: str):
+    """List docket folders from local data directory using os.walk."""
+    agency_path = os.path.join(LOCAL_DATA_PATH, agency)
+    if not os.path.isdir(agency_path):
+        return []
+    return sorted([
+        name for name in os.listdir(agency_path)
+        if os.path.isdir(os.path.join(agency_path, name))
+    ])
+
+
+def list_document_jsons_local(agency: str, docket_id: str):
+    """
+    List all document JSON files under:
+      <LOCAL_DATA_PATH>/<agency>/<docket-id>/text-<docket-id>/
+    Uses os.walk to efficiently traverse the directory tree.
+    Returns a list of full file paths for each document JSON.
+    """
+    docket_path = os.path.join(LOCAL_DATA_PATH, agency, docket_id, f"text-{docket_id}")
+    if not os.path.isdir(docket_path):
+        return []
+
+    json_files = []
+    for root, dirs, files in os.walk(docket_path):
+        for fname in files:
+            if fname.endswith(".json"):
+                json_files.append(os.path.join(root, fname))
+
+    return sorted(json_files)
+
+
+def read_document_json_local(path):
+    """Read and parse a single document JSON from local filesystem."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        log.error("Failed to parse JSON at %s: %s", path, e)
         return None
 
 # ---------------------------------------------------------------------------
@@ -379,17 +437,22 @@ def list_agencies(s3):
 # ---------------------------------------------------------------------------
 
 def run(start: int, end: int, since_date=None):
-    s3        = get_s3_client()
+    use_local = bool(LOCAL_DATA_PATH)
+    s3        = None if use_local else get_s3_client()
     os_client = get_opensearch_client()
     session   = get_http_session()
 
     ensure_index(os_client)
 
-    log.info("Listing all agencies in s3://%s/%s/...", S3_BUCKET, S3_PREFIX)
-    agencies = list_agencies(s3)
+    if use_local:
+        log.info("Using local data from: %s", LOCAL_DATA_PATH)
+        agencies = list_agencies_local()
+    else:
+        log.info("Listing all agencies in s3://%s/%s/...", S3_BUCKET, S3_PREFIX)
+        agencies = list_agencies(s3)
 
     if not agencies:
-        log.error("No agencies found in s3://%s/%s/ — check bucket and credentials", S3_BUCKET, S3_PREFIX)
+        log.error("No agencies found — check LOCAL_DATA_PATH or S3 bucket/credentials")
         sys.exit(1)
 
     total_agencies = len(agencies)
@@ -413,7 +476,7 @@ def run(start: int, end: int, since_date=None):
     for agency_idx, agency in enumerate(selected, start=start):
         log.info("*** Agency %d / %d: %s ***", agency_idx, total_agencies, agency)
 
-        dockets = list_dockets(s3, agency)
+        dockets = list_dockets_local(agency) if use_local else list_dockets(s3, agency)
         if not dockets:
             log.warning("No dockets found for agency '%s' — skipping", agency)
             continue
@@ -423,7 +486,7 @@ def run(start: int, end: int, since_date=None):
         for d_idx, docket_id in enumerate(dockets, start=1):
             log.info("=== Docket %d / %d: %s ===", d_idx, len(dockets), docket_id)
 
-            doc_keys = list_document_jsons(s3, agency, docket_id)
+            doc_keys = list_document_jsons_local(agency, docket_id) if use_local else list_document_jsons(s3, agency, docket_id)
             if not doc_keys:
                 log.warning("No document JSONs found for docket '%s' — skipping", docket_id)
                 continue
@@ -433,7 +496,7 @@ def run(start: int, end: int, since_date=None):
             log.info("Found %d documents in docket %s", len(doc_keys), docket_id)
 
             for doc_key in doc_keys:
-                data = read_document_json(s3, doc_key)
+                data = read_document_json_local(doc_key) if use_local else read_document_json(s3, doc_key)
                 if data is None:
                     continue
                 process_document(data, docket_id, session, os_client, since_date=since_date)

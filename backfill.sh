@@ -19,17 +19,31 @@ set -e
 # Arguments
 # ---------------------------------------------------------------------------
 if [ -z "$1" ]; then
-    echo "Usage: ./run_backfill.sh <start> [end]"
+    echo "Usage: ./run_backfill.sh <start> [end] [--since YYYY-MM-DD]"
     echo ""
-    echo "  start   Agency index to start from (1-based)"
-    echo "  end     Agency index to stop at, inclusive (default: same as start)"
+    echo "  start           Agency index to start from (1-based)"
+    echo "  end             Agency index to stop at, inclusive (default: same as start)"
+    echo "  --since DATE    Only process documents posted on or after this date"
     echo ""
-    echo "  To process all 315 agencies: ./run_backfill.sh 1 315"
+    echo "  Examples:"
+    echo "    ./run_backfill.sh 1 315                        # all agencies"
+    echo "    ./run_backfill.sh 1 315 --since 2026-04-01    # only new documents"
     exit 1
 fi
 
 START=$1
 END=${2:-$1}
+SINCE=""
+
+# Check for --since flag
+for i in "$@"; do
+    if [ "$i" = "--since" ]; then
+        SINCE_NEXT=1
+    elif [ -n "$SINCE_NEXT" ]; then
+        SINCE="--since $i"
+        unset SINCE_NEXT
+    fi
+done
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -70,7 +84,7 @@ echo "To monitor progress: tail -f $LOG_FILE"
 echo "To check if running: ps aux | grep ingest_regulations"
 echo ""
 
-nohup python3 "$SCRIPT_DIR/ingest_regulations.py" "$START" "$END" \
+nohup python3 "$SCRIPT_DIR/ingest_regulations.py" "$START" "$END" $SINCE \
     > "$LOG_FILE" 2>&1 &
 
 PID=$!
